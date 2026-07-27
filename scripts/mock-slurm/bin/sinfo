@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+list_reasons=0
+format=""
+
+while (($#)); do
+    case "$1" in
+    --list-reasons | -R)
+        list_reasons=1
+        shift
+        ;;
+    --format=*)
+        format="${1#*=}"
+        shift
+        ;;
+    --format | -o)
+        format="${2:-}"
+        shift 2
+        ;;
+    *)
+        shift
+        ;;
+    esac
+done
+
+if ((list_reasons)); then
+    # reason|timestamp|nodelist
+    cat <<'EOF'
+Kill task failed|2026-07-12T01:11:03|node002
+gres/gpu count reported lower than configured (0 < 2)|2026-04-27T14:33:12|node[013-014]
+Not responding|2026-06-30T08:08:19|node[021-024]
+EOF
+    exit 0
+fi
+
+# partition|availability|state|node count, one row per partition and state
+cat <<'EOF'
+gpu*|up|allocated|20
+gpu*|up|allocated$|4
+gpu*|up|mixed|6
+gpu*|up|idle|2
+cpu|up|allocated|100
+cpu|up|idle|20
+cpu|up|draining|1
+cpu|up|maint|3
+cpu|up|drained*|4
+debug|down|drained|4
+EOF

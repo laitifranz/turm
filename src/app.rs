@@ -28,6 +28,7 @@ pub enum Dialog {
     ConfirmCancelJob(String),
     SelectCancelSignal { id: String, selected_signal: usize },
     EditTimeLimit { id: String, input: Input },
+    ClusterInfo { info: ClusterInfo, offset: u16 },
     CommandError { command: String, output: String },
 }
 
@@ -67,6 +68,7 @@ pub struct App {
     job_list_height: u16,
     job_list_area: Rect,
     job_output_area: Rect,
+    cluster_info_height: u16,
     pending_input_event: Option<Event>,
 }
 
@@ -99,6 +101,38 @@ impl Job {
     }
 }
 
+/// Health snapshot of the cluster, obtained from `sinfo` on demand.
+pub struct ClusterInfo {
+    partitions: Vec<PartitionNodes>,
+    unavailable: Vec<UnavailableNodes>,
+}
+
+struct PartitionNodes {
+    name: String,
+    available: String,
+    free: u64,
+    busy: u64,
+    unavailable: u64,
+    total: u64,
+}
+
+/// What a node in a given Slurm state is worth to a user submitting a job now.
+#[derive(PartialEq, Eq, Debug)]
+enum NodeAvailability {
+    /// Idle and schedulable.
+    Free,
+    /// Running work, but still accepting jobs once it frees up.
+    Busy,
+    /// Takes no new jobs: down, drained, draining, reserved, in maintenance, ...
+    Unavailable,
+}
+
+struct UnavailableNodes {
+    nodes: String,
+    since: String,
+    reason: String,
+}
+
 pub enum AppMessage {
     Jobs(Vec<Job>),
     JobOutput(Result<String, FileWatcherError>),
@@ -125,6 +159,8 @@ pub(crate) enum MouseScrollTarget {
 
 const SCANCEL_SIGNALS: &[&str] = &["TERM", "INT", "HUP", "USR1", "USR2", "STOP", "CONT", "KILL"];
 const DIALOG_WIDTH: u16 = 80;
+const CLUSTER_DIALOG_WIDTH: u16 = 110;
+const CLUSTER_NODES_WIDTH: usize = 24;
 
 impl App {
     pub fn new(
@@ -159,6 +195,7 @@ impl App {
             job_list_height: 0,
             job_list_area: Rect::default(),
             job_output_area: Rect::default(),
+            cluster_info_height: 0,
             pending_input_event: None,
         }
     }
@@ -309,6 +346,7 @@ impl App {
                     let mut scancel_request = None;
                     let mut timelimit_request = None;
                     let mut command_failure = None;
+                    let cluster_info_height = self.cluster_info_height;
 
                     match self.dialog.as_mut().expect("dialog must exist") {
                         Dialog::ConfirmCancelJob(id) => match key.code {
@@ -365,6 +403,37 @@ impl App {
                                 input.handle_event(&Event::Key(key));
                             }
                         },
+                        Dialog::ClusterInfo { info, offset } => {
+                            let max_offset = (info.lines().len().min(u16::MAX as usize) as u16)
+                                .saturating_sub(cluster_info_height);
+                            match key.code {
+                                KeyCode::Enter | KeyCode::Esc | KeyCode::Char('i') => {
+                                    close_dialog = true;
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    *offset = offset.saturating_sub(1);
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    *offset = min(offset.saturating_add(1), max_offset);
+                                }
+                                KeyCode::PageUp => {
+                                    *offset = offset.saturating_sub(cluster_info_height.max(1));
+                                }
+                                KeyCode::PageDown => {
+                                    *offset = min(
+                                        offset.saturating_add(cluster_info_height.max(1)),
+                                        max_offset,
+                                    );
+                                }
+                                KeyCode::Home | KeyCode::Char('g') => {
+                                    *offset = 0;
+                                }
+                                KeyCode::End | KeyCode::Char('G') => {
+                                    *offset = max_offset;
+                                }
+                                _ => {}
+                            }
+                        }
                         Dialog::CommandError { .. } => match key.code {
                             KeyCode::Enter | KeyCode::Esc => {
                                 close_dialog = true;
@@ -473,6 +542,16 @@ impl App {
                                 });
                             }
                         }
+                        KeyCode::Char('i') => {
+                            // sinfo is only run when the user explicitly asks for it, so that
+                            // turm does not add periodic load on the Slurm controller.
+                            self.dialog = Some(match fetch_cluster_info() {
+                                Ok(info) => Dialog::ClusterInfo { info, offset: 0 },
+                                Err(CommandFailure { command, output }) => {
+                                    Dialog::CommandError { command, output }
+                                }
+                            });
+                        }
                         KeyCode::Char('o') => {
                             self.output_file_view = match self.output_file_view {
                                 OutputFileView::Stdout => OutputFileView::Stderr,
@@ -551,6 +630,7 @@ impl App {
             ("t", "set time limit"),
             ("o", "toggle stdout/stderr"),
             ("w", "toggle text wrap"),
+            ("i", "cluster info"),
         ];
         let blue_style = Style::default().fg(Color::Blue);
         let light_blue_style = Style::default().fg(Color::LightBlue);
@@ -782,6 +862,7 @@ impl App {
                         f,
                         "Cancel",
                         Color::Green,
+                        DIALOG_WIDTH,
                         3,
                         content,
                         Some(Wrap { trim: true }),
@@ -817,13 +898,14 @@ impl App {
                         f,
                         "Signal",
                         Color::Green,
+                        DIALOG_WIDTH,
                         SCANCEL_SIGNALS.len() as u16 + 4,
                         content,
                         Some(Wrap { trim: true }),
                     );
                 }
                 Dialog::EditTimeLimit { id, input } => {
-                    let area = dialog_area(3, f.area());
+                    let area = dialog_area(DIALOG_WIDTH, 3, f.area());
                     let inner = Block::default().borders(Borders::ALL).inner(area);
 
                     let prompt_prefix = "Set time limit for job ";
@@ -847,7 +929,15 @@ impl App {
                         Span::styled(visible_value, Style::default().fg(Color::Blue)),
                     ]));
 
-                    let inner = render_dialog(f, "Time Limit", Color::Green, 3, content, None);
+                    let inner = render_dialog(
+                        f,
+                        "Time Limit",
+                        Color::Green,
+                        DIALOG_WIDTH,
+                        3,
+                        content,
+                        None,
+                    );
 
                     let cursor_offset = input.visual_cursor().saturating_sub(scroll) as u16;
                     let cursor_x = inner
@@ -857,6 +947,28 @@ impl App {
                         .min(inner.x.saturating_add(inner.width.saturating_sub(1)));
                     let cursor_y = inner.y;
                     f.set_cursor_position((cursor_x, cursor_y));
+                }
+                Dialog::ClusterInfo { info, offset } => {
+                    let lines = info.lines();
+                    let height = lines.len().saturating_add(2).min(u16::MAX as usize) as u16;
+                    let content =
+                        Text::from(lines.into_iter().skip(*offset as usize).collect::<Vec<_>>());
+                    let title = if *offset == 0 {
+                        "Cluster".to_string()
+                    } else {
+                        format!("Cluster [+{offset}]")
+                    };
+
+                    let inner = render_dialog(
+                        f,
+                        &title,
+                        Color::Green,
+                        CLUSTER_DIALOG_WIDTH,
+                        height,
+                        content,
+                        None,
+                    );
+                    self.cluster_info_height = inner.height;
                 }
                 Dialog::CommandError { command, output } => {
                     let dialog_text = format!("Command: {command}\n\n{output}");
@@ -871,6 +983,7 @@ impl App {
                         f,
                         "Command Error",
                         Color::Red,
+                        DIALOG_WIDTH,
                         lines,
                         content,
                         Some(Wrap { trim: false }),
@@ -881,8 +994,8 @@ impl App {
     }
 }
 
-fn dialog_area(height: u16, viewport: Rect) -> Rect {
-    let dialog_width = min(DIALOG_WIDTH, viewport.width);
+fn dialog_area(width: u16, height: u16, viewport: Rect) -> Rect {
+    let dialog_width = min(width, viewport.width);
     let dialog_height = min(height, viewport.height);
     let dialog_x = viewport.x + viewport.width.saturating_sub(dialog_width) / 2;
     let dialog_y = viewport.y + viewport.height.saturating_sub(dialog_height) / 2;
@@ -894,6 +1007,7 @@ fn render_dialog(
     f: &mut Frame,
     title: &str,
     color: Color,
+    width: u16,
     height: u16,
     content: Text,
     wrap: Option<Wrap>,
@@ -904,7 +1018,7 @@ fn render_dialog(
         .border_type(BorderType::Rounded)
         .style(Style::default().fg(color));
 
-    let area = dialog_area(height, f.area());
+    let area = dialog_area(width, height, f.area());
     let inner = block.inner(area);
 
     let mut paragraph = Paragraph::new(content)
@@ -1129,6 +1243,277 @@ fn validated_time_limit(input: &Input) -> Option<String> {
     }
 }
 
+impl ClusterInfo {
+    /// Renders the cluster health as a table of partitions, followed by the nodes
+    /// that are currently unavailable (down, drained, ...).
+    fn lines(&self) -> Vec<Line<'static>> {
+        let yellow = Style::default().fg(Color::Yellow);
+        let dim = Style::default().add_modifier(Modifier::DIM);
+
+        let name_width = self
+            .partitions
+            .iter()
+            .map(|p| p.name.chars().count())
+            .max()
+            .unwrap_or(0)
+            .max("PARTITION".len());
+
+        let mut lines = vec![Line::from(Span::styled(
+            format!(
+                "{:<name_width$}  {:<5}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}  {:>7}",
+                "PARTITION", "AVAIL", "FREE", "BUSY", "UNAVAIL", "TOTAL", "FREE%", "USABLE"
+            ),
+            yellow,
+        ))];
+
+        if self.partitions.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "No partitions reported by sinfo.",
+                dim,
+            )));
+        }
+        lines.extend(self.partitions.iter().map(|p| {
+            let available_style = if p.available == "up" {
+                Style::default().fg(Color::Green)
+            } else {
+                Style::default().fg(Color::Red)
+            };
+            let unavailable_style = if p.unavailable == 0 {
+                dim
+            } else {
+                Style::default().fg(Color::Red)
+            };
+            let percent_span = |percent: Option<f64>, color: fn(f64) -> Color| match percent {
+                Some(percent) => Span::styled(
+                    format!("{percent:>6.1}%"),
+                    Style::default().fg(color(percent)),
+                ),
+                None => Span::styled(format!("{:>7}", "-"), dim),
+            };
+
+            Line::from(vec![
+                Span::raw(format!("{:<name_width$}  ", p.name)),
+                Span::styled(format!("{:<5}  ", p.available), available_style),
+                Span::styled(
+                    format!("{:>7}  ", p.free),
+                    Style::default().fg(Color::Green),
+                ),
+                Span::styled(
+                    format!("{:>7}  ", p.busy),
+                    Style::default().fg(Color::Yellow),
+                ),
+                Span::styled(format!("{:>7}  ", p.unavailable), unavailable_style),
+                Span::raw(format!("{:>7}  ", p.total)),
+                percent_span(p.free_percent(), free_color),
+                Span::raw("  "),
+                percent_span(p.usable_percent(), usable_color),
+            ])
+        }));
+
+        lines.push(Line::default());
+
+        if self.unavailable.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "All nodes are available.",
+                Style::default().fg(Color::Green),
+            )));
+            return lines;
+        }
+
+        lines.push(Line::from(Span::styled(
+            format!("Unavailable nodes ({})", self.unavailable.len()),
+            yellow,
+        )));
+        lines.extend(self.unavailable.iter().map(|n| {
+            Line::from(vec![
+                Span::styled(
+                    format!(
+                        "{:<CLUSTER_NODES_WIDTH$}  ",
+                        ellipsized(&n.nodes, CLUSTER_NODES_WIDTH)
+                    ),
+                    Style::default().fg(Color::Red),
+                ),
+                Span::styled(format!("{:<16}  ", n.since), dim),
+                Span::raw(n.reason.clone()),
+            ])
+        }));
+
+        lines
+    }
+}
+
+impl PartitionNodes {
+    /// Share of nodes that are idle and can run a job submitted right now.
+    fn free_percent(&self) -> Option<f64> {
+        self.percent_of_total(self.free)
+    }
+
+    /// Share of nodes that accept jobs at all, i.e. that are not down, drained, draining,
+    /// reserved or in maintenance. These are the nodes listed as unavailable below the table.
+    fn usable_percent(&self) -> Option<f64> {
+        self.percent_of_total(self.free + self.busy)
+    }
+
+    fn percent_of_total(&self, nodes: u64) -> Option<f64> {
+        if self.total == 0 {
+            return None;
+        }
+        Some(nodes as f64 / self.total as f64 * 100.0)
+    }
+}
+
+/// Shortens `s` to `width` characters, marking the cut with an ellipsis.
+fn ellipsized(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+
+    s.chars()
+        .take(width.saturating_sub(1))
+        .chain(once('…'))
+        .collect()
+}
+
+fn usable_color(percent: f64) -> Color {
+    if percent >= 95.0 {
+        Color::Green
+    } else if percent >= 80.0 {
+        Color::Yellow
+    } else {
+        Color::Red
+    }
+}
+
+/// Any idle node is good news, so this only distinguishes "something is free" from "nothing is".
+fn free_color(percent: f64) -> Color {
+    if percent > 0.0 {
+        Color::Green
+    } else {
+        Color::Red
+    }
+}
+
+fn fetch_cluster_info() -> Result<ClusterInfo, CommandFailure> {
+    let mut command = Command::new("sinfo");
+    command.arg("--noheader").arg("--format=%P|%a|%T|%D");
+    let partitions = run_command(command, "sinfo --noheader --format=%P|%a|%T|%D".to_string())?;
+
+    let mut command = Command::new("sinfo");
+    command
+        .arg("--noheader")
+        .arg("--list-reasons")
+        .arg("--format=%E|%H|%N");
+    let unavailable = run_command(
+        command,
+        "sinfo --noheader --list-reasons --format=%E|%H|%N".to_string(),
+    )?;
+
+    Ok(ClusterInfo {
+        partitions: parse_partition_nodes(&partitions),
+        unavailable: parse_unavailable_nodes(&unavailable),
+    })
+}
+
+/// Classifies a node state as reported by `sinfo`'s `%T`, e.g. `allocated`, `drained*`.
+///
+/// `sinfo`'s own `%F` counters are not usable here: they bucket by base state only, so a
+/// draining node counts as allocated and a node held by a maintenance reservation counts as
+/// idle, both of which take no new jobs. States we do not know about are assumed unavailable.
+fn classify_node_state(state: &str) -> NodeAvailability {
+    // Trailing flags: `*` not responding, `$` in a maintenance reservation, `~` powered down,
+    // `#` powering up, `%` powering down, `@` pending reboot. Only `*` makes a node unavailable
+    // on its own: powered-down nodes still accept jobs (Slurm wakes them), and `$` is reported
+    // for nodes *running* jobs inside a maintenance reservation, which are busy rather than
+    // broken. Idle nodes held by such a reservation are reported as `maint` instead, and that
+    // base state is unavailable below.
+    let flag_start = state.find(['*', '$', '~', '#', '%', '@']);
+    let (base, flags) = state.split_at(flag_start.unwrap_or(state.len()));
+    if flags.contains('*') {
+        return NodeAvailability::Unavailable;
+    }
+
+    match base {
+        "idle" => NodeAvailability::Free,
+        // `planned` nodes are idle but held for a pending job, so they are not free to us.
+        "allocated" | "mixed" | "completing" | "planned" => NodeAvailability::Busy,
+        _ => NodeAvailability::Unavailable,
+    }
+}
+
+/// Parses `sinfo --noheader --format=%P|%a|%T|%D`, e.g. `gpu*|up|draining|2`, summing the
+/// per-state rows `sinfo` emits for each partition into one row per partition.
+fn parse_partition_nodes(output: &str) -> Vec<PartitionNodes> {
+    let mut partitions: Vec<PartitionNodes> = Vec::new();
+
+    for line in output.lines() {
+        let mut fields = line.splitn(4, '|');
+        let Some(((name, available), (state, count))) = fields
+            .next()
+            .zip(fields.next())
+            .zip(fields.next().zip(fields.next()))
+        else {
+            continue;
+        };
+        let name = name.trim();
+        let Ok(count) = count.trim().parse::<u64>() else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+
+        let partition = match partitions.iter_mut().find(|p| p.name == name) {
+            Some(partition) => partition,
+            None => {
+                partitions.push(PartitionNodes {
+                    name: name.to_string(),
+                    available: available.trim().to_string(),
+                    free: 0,
+                    busy: 0,
+                    unavailable: 0,
+                    total: 0,
+                });
+                partitions.last_mut().expect("just pushed")
+            }
+        };
+
+        match classify_node_state(state.trim()) {
+            NodeAvailability::Free => partition.free += count,
+            NodeAvailability::Busy => partition.busy += count,
+            NodeAvailability::Unavailable => partition.unavailable += count,
+        }
+        partition.total += count;
+    }
+
+    partitions
+}
+
+/// Parses `sinfo --noheader --list-reasons --format=%E|%H|%N`,
+/// e.g. `Kill task failed|2026-07-12T01:11:03|node[04-05]`.
+fn parse_unavailable_nodes(output: &str) -> Vec<UnavailableNodes> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.splitn(3, '|');
+            let reason = fields.next()?.trim();
+            let since = fields.next()?.trim();
+            let nodes = fields.next()?.trim();
+            if nodes.is_empty() {
+                return None;
+            }
+
+            Some(UnavailableNodes {
+                nodes: nodes.to_string(),
+                since: since.replace('T', " ").chars().take(16).collect(),
+                reason: reason.to_string(),
+            })
+        })
+        .collect()
+}
+
 fn execute_scancel(job_id: &str, signal: Option<&str>) -> Result<(), CommandFailure> {
     let mut command = Command::new("scancel");
     let mut command_display = String::from("scancel");
@@ -1156,14 +1541,19 @@ fn execute_scontrol_update_timelimit(job_id: &str, time_limit: &str) -> Result<(
     )
 }
 
-fn execute_command(mut command: Command, command_label: String) -> Result<(), CommandFailure> {
+fn execute_command(command: Command, command_label: String) -> Result<(), CommandFailure> {
+    run_command(command, command_label).map(|_| ())
+}
+
+/// Runs a command and returns its stdout, or a failure describing why it did not succeed.
+fn run_command(mut command: Command, command_label: String) -> Result<String, CommandFailure> {
     let output = command.output().map_err(|error| CommandFailure {
         command: command_label.clone(),
         output: error.to_string(),
     })?;
 
     if output.status.success() {
-        return Ok(());
+        return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
     }
 
     let mut details = vec![match output.status.code() {
@@ -1243,6 +1633,173 @@ mod tests {
         let input = "123456789";
         let expected = vec!["123456789"];
         assert_eq!(chunked_string(input, 0, 0), expected);
+    }
+
+    #[test]
+    fn test_classify_node_state() {
+        use NodeAvailability::{Busy, Free, Unavailable};
+
+        assert_eq!(classify_node_state("idle"), Free);
+        assert_eq!(classify_node_state("allocated"), Busy);
+        assert_eq!(classify_node_state("mixed"), Busy);
+        assert_eq!(classify_node_state("completing"), Busy);
+        // Held for a pending job, so busy rather than free.
+        assert_eq!(classify_node_state("planned"), Busy);
+
+        // Takes no new jobs even though sinfo's %F counts these as allocated or idle.
+        assert_eq!(classify_node_state("draining"), Unavailable);
+        assert_eq!(classify_node_state("drained"), Unavailable);
+        assert_eq!(classify_node_state("maint"), Unavailable);
+        assert_eq!(classify_node_state("reserved"), Unavailable);
+        assert_eq!(classify_node_state("down"), Unavailable);
+
+        // A node that is not responding is unavailable whatever its base state is.
+        assert_eq!(classify_node_state("idle*"), Unavailable);
+        assert_eq!(classify_node_state("allocated*"), Unavailable);
+
+        // A node running jobs inside a maintenance reservation is busy, not broken; an idle
+        // one in the same reservation is reported as `maint` and stays unavailable.
+        assert_eq!(classify_node_state("allocated$"), Busy);
+        assert_eq!(classify_node_state("mixed$"), Busy);
+
+        // Powered-down nodes are woken up by Slurm when a job needs them.
+        assert_eq!(classify_node_state("idle~"), Free);
+        assert_eq!(classify_node_state("allocated#"), Busy);
+
+        // Unknown states are assumed unusable rather than silently counted as capacity.
+        assert_eq!(classify_node_state("some_future_state"), Unavailable);
+        assert_eq!(classify_node_state(""), Unavailable);
+    }
+
+    #[test]
+    fn test_parse_partition_nodes() {
+        // Per-state rows of the same partition are summed into a single row.
+        let output = "gpu*|up|allocated|24\ngpu*|up|mixed|6\ngpu*|up|idle|2\n\
+                      cpu|down|allocated|100\ncpu|down|idle|20\ncpu|down|drained|8\n";
+        let partitions = parse_partition_nodes(output);
+
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions[0].name, "gpu*");
+        assert_eq!(partitions[0].available, "up");
+        assert_eq!(
+            (
+                partitions[0].free,
+                partitions[0].busy,
+                partitions[0].unavailable,
+                partitions[0].total
+            ),
+            (2, 30, 0, 32)
+        );
+        assert_eq!(partitions[1].name, "cpu");
+        assert_eq!(partitions[1].available, "down");
+        assert_eq!(
+            (
+                partitions[1].free,
+                partitions[1].busy,
+                partitions[1].unavailable,
+                partitions[1].total
+            ),
+            (20, 100, 8, 128)
+        );
+
+        // Draining and maintenance nodes are unavailable, not capacity.
+        let partitions = parse_partition_nodes("gpu|up|draining|1\ngpu|up|maint|3\ngpu|up|idle|6");
+        assert_eq!(
+            (
+                partitions[0].free,
+                partitions[0].busy,
+                partitions[0].unavailable,
+                partitions[0].total
+            ),
+            (6, 0, 4, 10)
+        );
+
+        // Malformed or empty lines are skipped.
+        assert!(parse_partition_nodes("").is_empty());
+        assert!(parse_partition_nodes("gpu|up|idle\n|up|idle|3\ngpu|up|idle|x\n").is_empty());
+    }
+
+    #[test]
+    fn test_parse_unavailable_nodes() {
+        let output = "Kill task failed|2026-07-12T01:11:03|node[04-05]\nNot responding|2026-06-30T08:08:19|node07\n";
+        let nodes = parse_unavailable_nodes(output);
+
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].nodes, "node[04-05]");
+        assert_eq!(nodes[0].since, "2026-07-12 01:11");
+        assert_eq!(nodes[0].reason, "Kill task failed");
+        assert_eq!(nodes[1].nodes, "node07");
+
+        // Reasons containing the separator keep everything after the timestamp as the node list.
+        let nodes = parse_unavailable_nodes("gres/gpu count (0 < 2)|2026-04-27T14:33:12|node13");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].nodes, "node13");
+
+        assert!(parse_unavailable_nodes("").is_empty());
+        assert!(parse_unavailable_nodes("reason|2026-04-27T14:33:12|\n").is_empty());
+    }
+
+    #[test]
+    fn test_ellipsized() {
+        assert_eq!(ellipsized("node01", 24), "node01");
+        assert_eq!(ellipsized("abcde", 5), "abcde");
+        assert_eq!(ellipsized("abcde", 4), "abc…");
+        assert_eq!(ellipsized("abcde", 0), "");
+    }
+
+    #[test]
+    fn test_partition_percentages() {
+        let partition = |free, busy, unavailable, total| PartitionNodes {
+            name: "gpu".to_string(),
+            available: "up".to_string(),
+            free,
+            busy,
+            unavailable,
+            total,
+        };
+
+        assert_eq!(partition(2, 30, 0, 32).usable_percent(), Some(100.0));
+        assert_eq!(partition(0, 0, 4, 4).usable_percent(), Some(0.0));
+        assert_eq!(partition(0, 0, 0, 0).usable_percent(), None);
+        assert_eq!(partition(1, 3, 4, 8).usable_percent(), Some(50.0));
+
+        assert_eq!(partition(8, 24, 0, 32).free_percent(), Some(25.0));
+        assert_eq!(partition(0, 30, 2, 32).free_percent(), Some(0.0));
+        assert_eq!(partition(0, 0, 0, 0).free_percent(), None);
+    }
+
+    #[test]
+    fn test_cluster_info_lines() {
+        let info = ClusterInfo {
+            partitions: parse_partition_nodes(
+                "gpu*|up|allocated|30\ngpu*|up|idle|2\ndebug|down|drained|4\n",
+            ),
+            unavailable: parse_unavailable_nodes("Kill task failed|2026-07-12T01:11:03|node04"),
+        };
+        let lines: Vec<String> = info.lines().iter().map(ToString::to_string).collect();
+
+        assert!(lines[0].starts_with("PARTITION"));
+        assert!(lines[1].starts_with("gpu*  "));
+        // 2 of 32 nodes free, none unavailable.
+        assert!(lines[1].ends_with("   6.2%   100.0%"));
+        assert!(lines[2].ends_with("   0.0%     0.0%"));
+        assert!(lines.iter().any(|l| l == "Unavailable nodes (1)"));
+        assert!(lines.iter().any(|l| l.contains("node04")));
+
+        // A draining node makes the table agree with the unavailable list below it.
+        let draining = ClusterInfo {
+            partitions: parse_partition_nodes("gpu|up|allocated|9\ngpu|up|draining|1"),
+            unavailable: parse_unavailable_nodes("Kill task failed|2026-07-12T01:11:03|node04"),
+        };
+        let lines: Vec<String> = draining.lines().iter().map(ToString::to_string).collect();
+        assert!(lines[1].ends_with("   0.0%    90.0%"));
+
+        let healthy = ClusterInfo {
+            partitions: parse_partition_nodes("gpu|up|allocated|30\ngpu|up|idle|2"),
+            unavailable: Vec::new(),
+        };
+        let lines: Vec<String> = healthy.lines().iter().map(ToString::to_string).collect();
+        assert!(lines.iter().any(|l| l == "All nodes are available."));
     }
 
     #[test]

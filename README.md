@@ -81,7 +81,7 @@ However, since inotify notifications are not supported for remote file systems, 
 
 ## Development without Slurm
 
-For local UI testing, this repository includes mocks for `squeue`, `scancel`, and `scontrol`:
+For local UI testing, this repository includes mocks for `squeue`, `scancel`, `scontrol`, and `sinfo`:
 
 ```shell
 PATH=scripts/mock-slurm/bin:$PATH cargo run -- --me
