@@ -7,15 +7,15 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug executable 'turm'",
+            "name": "Debug executable 'sbum'",
             "cargo": {
                 "args": [
                     "build",
-                    "--bin=turm",
-                    "--package=turm"
+                    "--bin=sbum",
+                    "--package=sbum"
                 ],
                 "filter": {
-                    "name": "turm",
+                    "name": "sbum",
                     "kind": "bin"
                 }
             },
@@ -28,16 +28,16 @@
         {
             "type": "lldb",
             "request": "launch",
-            "name": "Debug unit tests in executable 'turm'",
+            "name": "Debug unit tests in executable 'sbum'",
             "cargo": {
                 "args": [
                     "test",
                     "--no-run",
-                    "--bin=turm",
-                    "--package=turm"
+                    "--bin=sbum",
+                    "--package=sbum"
                 ],
                 "filter": {
-                    "name": "turm",
+                    "name": "sbum",
                     "kind": "bin"
                 }
             },

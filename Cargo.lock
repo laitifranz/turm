@@ -1238,6 +1238,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "sbum"
+version = "0.14.0"
+dependencies = [
+ "clap",
+ "clap_complete",
+ "crossbeam",
+ "crossterm",
+ "itertools",
+ "notify",
+ "ratatui",
+ "regex",
+ "tui-input",
+]
+
+[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1520,21 +1535,6 @@ checksum = "911e93158bf80bbc94bad533b2b16e3d711e1132d69a6a6980c3920a63422c19"
 dependencies = [
  "crossterm",
  "unicode-width",
-]
-
-[[package]]
-name = "turm"
-version = "0.14.0"
-dependencies = [
- "clap",
- "clap_complete",
- "crossbeam",
- "crossterm",
- "itertools",
- "notify",
- "ratatui",
- "regex",
- "tui-input",
 ]
 
 [[package]]
